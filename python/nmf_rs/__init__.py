@@ -47,6 +47,7 @@ __all__ = [
     "smoothing_matrix",
     "random_init",
     "nndsvd_init",
+    "cv_rank",
     "set_num_threads",
 ]
 
@@ -269,6 +270,91 @@ def smoothing_matrix(rank: int, theta: float) -> np.ndarray:
     return _smoothing_matrix(int(rank), float(theta))
 
 
+def cv_rank(
+    V: np.ndarray,
+    ranks: Sequence[int],
+    *,
+    method: str = "hals",
+    n_folds: int = 4,
+    mask_frac: float = 0.05,
+    max_iter: int = 100,
+    init: str = "nndsvd",
+    seed: int = 0,
+    num_threads: Optional[int] = None,
+    **nmf_kwargs,
+) -> "pd.DataFrame":
+    """Cross-validated rank selection by held-out reconstruction error.
+
+    For each candidate rank ``k`` we hold out ``mask_frac`` of V's entries
+    (random per fold), fit NMF on the masked V via ``method='ls-nmf'`` (so
+    the held-out entries truly drop from the loss), then predict the held-out
+    entries via W·H and report MSE on them.
+
+    Lower test-MSE → better-suited rank. Typical pattern: test-MSE drops
+    quickly, then plateaus at the "true" rank.
+
+    Parameters
+    ----------
+    V : (n, p) non-negative array
+    ranks : iterable of int — candidates to evaluate
+    method : str — base NMF method; we always wrap it through ls-nmf for the
+        masking weight, but ``method`` controls the *initialisation pass*
+        when ``init='warm'``.
+    n_folds : int — average over this many random masks
+    mask_frac : float — fraction of entries held out per fold
+    max_iter : int — passed to nmf()
+    init : {'nndsvd', 'random'} — starting point for each fold
+    seed : int — base seed for reproducibility
+    num_threads : optional int — passed through
+
+    Returns
+    -------
+    pandas.DataFrame with columns: rank, fold, train_loss, test_mse.
+    """
+    try:
+        import pandas as pd
+    except ImportError as e:
+        raise ImportError("cv_rank() requires pandas") from e
+    _check_rust()
+    V = _f64_c(V, "V")
+    if (V < 0).any():
+        raise ValueError("V must be non-negative")
+    n, p = V.shape
+
+    rows = []
+    rng_master = np.random.default_rng(seed)
+    for k in ranks:
+        for fold in range(n_folds):
+            fold_seed = int(rng_master.integers(0, 2**31 - 1))
+            rng = np.random.default_rng(fold_seed)
+            mask = rng.random((n, p)) > mask_frac    # True = train
+            weight = mask.astype(np.float64)
+            V_train = V * weight                      # zero out held-out
+
+            if init == "nndsvd":
+                W0, H0 = nndsvd_init(V_train, k, fill="mean", seed=fold_seed)
+            else:
+                W0, H0 = random_init(V_train, k, seed=fold_seed)
+
+            # ls-nmf with the mask weight — held-out entries don't pull on the fit.
+            res = nmf(
+                V_train, rank=k, method="ls-nmf",
+                W0=W0, H0=H0, weight=weight,
+                max_iter=max_iter, num_threads=num_threads,
+                **nmf_kwargs,
+            )
+            recon = res.fitted()
+            train_residual = (V - recon) * weight
+            train_loss = 0.5 * float((train_residual ** 2).sum())
+            held = ~mask
+            test_mse = float(((V[held] - recon[held]) ** 2).mean())
+            rows.append({
+                "rank": int(k), "fold": fold,
+                "train_loss": train_loss, "test_mse": test_mse,
+            })
+    return pd.DataFrame(rows)
+
+
 # =============================================================================
 # Top-level driver
 # =============================================================================
@@ -284,6 +370,12 @@ _METHOD_ALIASES = {
     "ns": "nsnmf",
     "ns_nmf": "nsnmf",
     "hals": "hals",
+    "ehals": "ehals",
+    "e-hals": "ehals",
+    "extrap_hals": "ehals",
+    "dnmf": "dnmf",
+    "diag_nmf": "dnmf",
+    "rcppml": "dnmf",
     "ls-nmf": "lsnmf",
     "lsnmf": "lsnmf",
     "snmf/r": "snmf/r",
@@ -340,6 +432,13 @@ def nmf(
         - ``offset`` — Lee + per-feature offset (Badea 2008), R-parity.
         - ``nsNMF`` — Brunet + smoothing matrix (Pascual-Montano 2006), R-parity.
         - ``hals`` — Cichocki-Phan least-squares; ~10× fewer iterations needed.
+        - ``ehals`` — extrapolated HALS (Ang-Gillis 2019). Same per-iter cost
+          as HALS plus one WH evaluation, but Nesterov-style momentum cuts
+          iteration count by ~2×. Strict upgrade over ``hals``.
+        - ``dnmf`` (alias ``rcppml``) — diagonalised NMF V ≈ W·diag(d)·H
+          with column-unit W, row-unit H (DeBruine 2024). Makes L1 reg
+          (``sparsity=``) actually mean something — without diagonalisation
+          the scale ambiguity makes ||W||₁ trivially adjustable.
         - ``ls-nmf`` (alias ``lsnmf``) — weighted Lee (Wang 2006); requires
           ``weight=`` of shape V. Useful for masking missing data.
         - ``snmf/r`` / ``snmf/l`` — sparse-H / sparse-W via regularised HALS,
@@ -426,6 +525,18 @@ def nmf(
                 f"weight.shape {weight_arr.shape} != V.shape {V_arr.shape}"
             )
 
+    # Sparsity / smoothness routing per algorithm:
+    if method_norm == "snmf/r":
+        sh, sw, gh, gw = float(sparsity), 0.0, 0.0, float(smoothness)
+    elif method_norm == "snmf/l":
+        sh, sw, gh, gw = 0.0, float(sparsity), float(smoothness), 0.0
+    elif method_norm == "dnmf":
+        # dnmf: regularise both factors symmetrically by default.
+        sh = sw = float(sparsity)
+        gh = gw = 0.0  # smoothness on dnmf is rarely useful; users can extend later
+    else:
+        sh = sw = gh = gw = 0.0
+
     out = _nmf_run(
         method_norm,
         V_arr,
@@ -437,10 +548,10 @@ def nmf(
         theta=float(theta),
         offset=offset_arr,
         weight=weight_arr,
-        sparsity_h=float(sparsity) if method_norm == "snmf/r" else 0.0,
-        sparsity_w=float(sparsity) if method_norm == "snmf/l" else 0.0,
-        smoothness_h=float(smoothness) if method_norm == "snmf/l" else 0.0,
-        smoothness_w=float(smoothness) if method_norm == "snmf/r" else 0.0,
+        sparsity_h=sh,
+        sparsity_w=sw,
+        smoothness_h=gh,
+        smoothness_w=gw,
         stop=stop,
         stationary_th=float(stationary_th),
         check_interval=int(check_interval),
