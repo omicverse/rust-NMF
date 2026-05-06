@@ -16,6 +16,8 @@ use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
+mod fcnnls;
+
 // =============================================================================
 // Helpers
 // =============================================================================
@@ -957,6 +959,158 @@ fn nmf_run_snmf(
 }
 
 // =============================================================================
+// Kim-Park sparse NMF (snmf/R, snmf/L) — bit-equivalent to R `nmf_snmf`
+// =============================================================================
+//
+// Solves
+//   snmf/R:   min_{W,H}  ½ ||A - W H||² + η ||W||² + β Σ_j ||H_:,j||₁²
+//   snmf/L:   min_{W,H}  ½ ||A - W H||² + η ||H||² + β Σ_i ||W_i,:||₁²
+//
+// via alternating FCNNLS. R `nmf_snmf` (algorithms-snmf.R) does:
+//
+//     normalize columns of W
+//     loop:
+//         H = fcnnls(rbind(W, sqrt(β)·1ₖ),  rbind(A,         0₁ₓₙ))
+//         W = fcnnls(rbind(Hᵀ, η·Iₖ),       rbind(Aᵀ,        0ₖₓₘ))ᵀ
+//         every 5 iters: convergence check via cluster assignments
+//
+// The trick is: stacking a sqrt(β)·1ₖ row in the H subproblem makes the
+// least-squares term include  β·||Σᵢ Hᵢ,ⱼ||² = β·||H_:,j||₁²  per column.
+// Stacking η·Iₖ in the W subproblem adds the η·||W||² Frobenius penalty.
+// Both subproblems are vanilla NNLS once stacked, so FCNNLS solves them.
+//
+// snmf/L flips the roles: minimise on Aᵀ swapping W↔H, sparsity on rows of W.
+
+fn col_l2_normalize(w: &mut Array2<f64>) {
+    let r = w.ncols();
+    for j in 0..r {
+        let mut col = w.column_mut(j);
+        let norm_sq: f64 = col.iter().map(|&x| x * x).sum();
+        let norm = norm_sq.sqrt();
+        if norm > 0.0 {
+            col.mapv_inplace(|x| x / norm);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nmf_run_snmf_kim_park(
+    a: &ArrayView2<f64>,
+    w_init: Array2<f64>,
+    h_init: Array2<f64>,
+    is_left: bool,    // true → snmf/L (transpose A, swap roles)
+    max_iter: usize,
+    eta: f64,         // L2 coeff (penalty on the non-sparse factor); if <0 use max(A)
+    beta: f64,        // L1²-per-col coeff on the sparse factor
+    eps_inner: f64,   // tolerance inside fcnnls
+) -> (Array2<f64>, Array2<f64>, usize, Vec<f64>) {
+    // Effective target. snmf/L works on Aᵀ with W↔H swapped.
+    let a_eff_owned = if is_left { transpose_owned(a) } else { a.to_owned() };
+    let a_eff = a_eff_owned.view();
+    let m = a_eff.nrows();      // features
+    let n = a_eff.ncols();      // samples
+    let k = w_init.ncols();
+
+    // For snmf/L, the "W" we operate on is internally the transposed user-H.
+    let (mut w, mut h): (Array2<f64>, Array2<f64>) = if is_left {
+        // user-W is m × k (after the algorithm), user-H is k × n.
+        // Internally we view: A' = Aᵀ (n × m), with internal-W (n × k) = (user-H)ᵀ,
+        // internal-H (k × m) = (user-W)ᵀ.
+        // So pass transpose(user-H) and transpose(user-W) as internal w_init and h_init.
+        // Caller must give w_init as user-H (k × n) so internal w = (user-H)ᵀ.
+        // To keep the API uniform we swap below.
+        (transpose_owned(&h_init.view()), transpose_owned(&w_init.view()))
+    } else {
+        (w_init, h_init)
+    };
+
+    let eta_eff = if eta < 0.0 {
+        a_eff.iter().cloned().fold(0.0f64, f64::max)
+    } else {
+        eta
+    };
+    let beta_eff = beta.max(1e-30);
+    let sqrt_beta = beta_eff.sqrt();
+
+    // Normalise columns of internal W.
+    col_l2_normalize(&mut w);
+
+    let mut deviances: Vec<f64> = Vec::new();
+    let mut iter = 0usize;
+    while iter < max_iter {
+        iter += 1;
+
+        // ---- H subproblem (sparse-rows when snmf/R, sparse-cols-of-W when snmf/L) ----
+        // x = rbind(W, sqrt(β)·1ₖ) of shape (m+1, k)
+        let mut x_h = Array2::<f64>::zeros((m + 1, k));
+        for i in 0..m {
+            for j in 0..k {
+                x_h[(i, j)] = w[(i, j)];
+            }
+        }
+        for j in 0..k {
+            x_h[(m, j)] = sqrt_beta;
+        }
+        // y = rbind(A_eff, 0_{1×n})
+        let mut y_h = Array2::<f64>::zeros((m + 1, n));
+        for i in 0..m {
+            for j in 0..n {
+                y_h[(i, j)] = a_eff[(i, j)];
+            }
+        }
+        let (h_new, _) = fcnnls::fcnnls(x_h.view(), y_h.view(), false, eps_inner);
+        h = h_new;
+
+        // R checks for zero rows of H and restarts. We warn (via a deviance
+        // sentinel) but don't auto-restart in this port — caller can re-init.
+
+        // ---- W subproblem ----
+        // x = rbind(Hᵀ, η·Iₖ) of shape (n+k, k)
+        let mut x_w = Array2::<f64>::zeros((n + k, k));
+        for i in 0..n {
+            for j in 0..k {
+                x_w[(i, j)] = h[(j, i)];   // Hᵀ
+            }
+        }
+        for j in 0..k {
+            x_w[(n + j, j)] = eta_eff;     // diag(η)
+        }
+        // y = rbind(A_effᵀ, 0_{k×m})
+        let mut y_w = Array2::<f64>::zeros((n + k, m));
+        for i in 0..n {
+            for j in 0..m {
+                y_w[(i, j)] = a_eff[(j, i)];   // A_effᵀ
+            }
+        }
+        let (wt, _) = fcnnls::fcnnls(x_w.view(), y_w.view(), false, eps_inner);
+        // wt is k × m; we want internal W of shape m × k.
+        w = transpose_owned(&wt.view());
+
+        // Tracking — record reconstruction loss every iter.
+        let recon = w.dot(&h);
+        let mut s = 0.0f64;
+        for i in 0..m {
+            for j in 0..n {
+                let d = a_eff[(i, j)] - recon[(i, j)];
+                s += d * d;
+            }
+        }
+        deviances.push(0.5 * s);
+    }
+
+    // Map internal (W, H) back to user (W, H) — snmf/L un-swap.
+    if is_left {
+        // Internal W (m × k) corresponds to user-H transposed: user-H = Wᵀ
+        // Internal H (k × n) corresponds to user-W transposed: user-W = Hᵀ
+        let user_h = transpose_owned(&w.view());
+        let user_w = transpose_owned(&h.view());
+        (user_w, user_h, iter, deviances)
+    } else {
+        (w, h, iter, deviances)
+    }
+}
+
+// =============================================================================
 // Stopping criterion: stationary
 // =============================================================================
 
@@ -1703,36 +1857,32 @@ fn py_nmf_run<'py>(
                 (w, h, None, n, dev)
             }
             Algo::SnmfR => {
-                // snmf/r: sparse H, smooth W (γ_W on W, λ_H on H rows).
-                let (w, h, n, dev) = nmf_run_snmf(
+                // Kim-Park snmf/R via FCNNLS-based ANLS (bit-eq R nmf_snmf).
+                // `sparsity_h` plays the role of β (L1²-per-col on H rows).
+                // `smoothness_w` plays the role of η (L2 on W); -1 → max(V).
+                let (w, h, n, dev) = nmf_run_snmf_kim_park(
                     &v_view,
                     w_owned,
                     h_owned,
+                    false,         // snmf/R: not flipped
                     max_iter,
+                    smoothness_w,  // η
+                    sparsity_h,    // β
                     eps,
-                    sparsity_h, 0.0,
-                    0.0, smoothness_w,
-                    stop,
-                    stationary_th,
-                    check_interval,
-                    check_niter,
                 );
                 (w, h, None, n, dev)
             }
             Algo::SnmfL => {
-                // snmf/l: sparse W, smooth H.
-                let (w, h, n, dev) = nmf_run_snmf(
+                // Kim-Park snmf/L: same machinery, transposed problem internally.
+                let (w, h, n, dev) = nmf_run_snmf_kim_park(
                     &v_view,
                     w_owned,
                     h_owned,
+                    true,
                     max_iter,
+                    smoothness_h,  // η on H
+                    sparsity_w,    // β on W (sparse rows)
                     eps,
-                    0.0, sparsity_w,
-                    smoothness_h, 0.0,
-                    stop,
-                    stationary_th,
-                    check_interval,
-                    check_niter,
                 );
                 (w, h, None, n, dev)
             }

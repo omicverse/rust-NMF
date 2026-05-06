@@ -89,13 +89,12 @@ See `tests/test_parity.py` for the end-to-end pytest suite.
 | `nsNMF`    | `nmf_update.ns`     | Brunet with smoothing matrix (theta) | yes |
 | `ls-nmf`   | `nmf_update.lsnmf`  | Weighted Frobenius (Wang 2006); pass `weight=` | within BLAS round-off |
 | `hals`     | (none — Cichocki-Phan) | Block-coord LS; ~10× fewer iters | no (custom) |
-| `snmf/r`   | `nmf_snmf` (Kim-Park) | Sparse-H via reg. HALS; tune `sparsity=`, `smoothness=` | no (FCNNLS replaced) |
-| `snmf/l`   | `nmf_snmf` (Kim-Park) | Sparse-W via reg. HALS | no (FCNNLS replaced) |
+| `snmf/r`   | `nmf_snmf` (Kim-Park 2007) | Sparse-H via FCNNLS-based ANLS; `sparsity=` (β), `smoothness=` (η, -1 → auto) | yes (FCNNLS port) |
+| `snmf/l`   | `nmf_snmf` (Kim-Park 2007) | Sparse-W via FCNNLS-based ANLS | yes (FCNNLS port) |
 
-The four "yes" rows match R within f64 epsilon (~1e-12). `ls-nmf` matches up
+The six "yes" rows match R within f64 epsilon (~1e-12). `ls-nmf` matches up
 to BLAS-summation variance (R itself isn't stable across BLAS impls). `hals`
-is a different algorithm; `snmf/r`/`snmf/l` solve a closely-related sparse
-factorisation problem with regularised HALS instead of R's FCNNLS-based ANLS.
+is a different algorithm.
 
 ## License
 

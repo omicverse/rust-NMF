@@ -42,6 +42,7 @@ tests/data/
 
 # Allow tracked Rscript fixtures
 !tests/reference_nmf.R
+!tests/reference_snmf.R
 
 # Cargo lock kept (binary crate)
 !rust/Cargo.lock

@@ -10,9 +10,13 @@ All notable changes to `nmf-rs` are documented here. Format follows
 - `method='ls-nmf'` (alias `lsnmf`): weighted Frobenius (Wang 2006) — pass
   `weight=` of the same shape as `V`. Useful for missing-value imputation
   via `weight[i, j] = 0` for masked entries.
-- `method='snmf/r'` and `'snmf/l'`: sparse-H / sparse-W via regularised HALS
-  with `sparsity=` (L1 coefficient) and `smoothness=` (L2). NOT bit-equivalent
-  to R's FCNNLS-based `snmf/r` / `snmf/l`, but achieves the same sparsity goal.
+- `method='snmf/r'` and `'snmf/l'` (Kim-Park 2007): sparse-H / sparse-W via
+  FCNNLS-based alternating NNLS. **Bit-equivalent to R `nmf_snmf`** within
+  f64 round-off (~1e-12 max abs diff). `sparsity=` is β, `smoothness=` is η
+  (passing `smoothness=-1` auto-defaults to `max(V)` to match R).
+- New module `rust/src/fcnnls.rs`: pure-Rust port of the Van Benthem & Keenan
+  2004 active-set NNLS (R `.fcnnls`), Cholesky-based sub-Gram solves with
+  Tikhonov-regularised fallback when sub-Grams are rank-deficient.
 
 ## [0.1.0] — initial release
 

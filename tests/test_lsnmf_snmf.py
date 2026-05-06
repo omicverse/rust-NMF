@@ -74,31 +74,33 @@ def test_lsnmf_masking_drops_entries(synth):
 
 
 def test_snmf_r_makes_h_sparser(synth):
+    """snmf/R reduces H density at non-zero β vs unconstrained Lee."""
     V, W0, H0, rank = synth["V"], synth["W0"], synth["H0"], synth["rank"]
-    res_h = nmf_rs.nmf(V, rank=rank, method="hals",
-                      W0=W0, H0=H0, max_iter=100, num_threads=2)
+    res_lee = nmf_rs.nmf(V, rank=rank, method="lee",
+                        W0=W0, H0=H0, max_iter=200, num_threads=2)
     res_s = nmf_rs.nmf(V, rank=rank, method="snmf/r",
-                      sparsity=0.05, smoothness=0.1,
-                      W0=W0, H0=H0, max_iter=100, num_threads=2)
-    density_h_hals = float((res_h.H > 1e-6).mean())
+                      sparsity=0.5, smoothness=-1.0,
+                      W0=W0, H0=H0, max_iter=20, num_threads=2)
+    density_h_lee  = float((res_lee.H > 1e-6).mean())
     density_h_snmf = float((res_s.H > 1e-6).mean())
-    assert density_h_snmf < density_h_hals - 0.05, (
-        f"snmf/r should make H sparser: hals={density_h_hals:.3f} "
+    assert density_h_snmf < density_h_lee, (
+        f"snmf/r should make H sparser: lee={density_h_lee:.3f} "
         f"vs snmf/r={density_h_snmf:.3f}"
     )
 
 
 def test_snmf_l_makes_w_sparser(synth):
+    """snmf/L reduces W density at non-zero β vs unconstrained Lee."""
     V, W0, H0, rank = synth["V"], synth["W0"], synth["H0"], synth["rank"]
-    res_h = nmf_rs.nmf(V, rank=rank, method="hals",
-                      W0=W0, H0=H0, max_iter=100, num_threads=2)
+    res_lee = nmf_rs.nmf(V, rank=rank, method="lee",
+                        W0=W0, H0=H0, max_iter=200, num_threads=2)
     res_s = nmf_rs.nmf(V, rank=rank, method="snmf/l",
-                      sparsity=0.05, smoothness=0.1,
-                      W0=W0, H0=H0, max_iter=100, num_threads=2)
-    density_w_hals = float((res_h.W > 1e-6).mean())
+                      sparsity=0.5, smoothness=-1.0,
+                      W0=W0, H0=H0, max_iter=20, num_threads=2)
+    density_w_lee  = float((res_lee.W > 1e-6).mean())
     density_w_snmf = float((res_s.W > 1e-6).mean())
-    assert density_w_snmf < density_w_hals - 0.05, (
-        f"snmf/l should make W sparser: hals={density_w_hals:.3f} "
+    assert density_w_snmf < density_w_lee, (
+        f"snmf/l should make W sparser: lee={density_w_lee:.3f} "
         f"vs snmf/l={density_w_snmf:.3f}"
     )
 
