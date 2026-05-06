@@ -486,61 +486,61 @@ fn smoothing_matrix(r: usize, theta: f64) -> ndarray::Array2<f64> {
 // Output is *not* bit-equivalent to R's `lsNMF` (different update structure)
 // but the factorisation it converges to is the same up to column permutation.
 
-/// Compute W^T V using pre-transposed buffers so all inner reductions are
-/// stride-1 sequential reads (great for SIMD auto-vectorisation).
+/// Compute W^T V via ndarray's `matrixmultiply`-backed gemm, with rayon
+/// chunking on the output columns so we get multi-threading on top of
+/// matrixmultiply's SIMD blocking. Used by HALS only.
 fn compute_wtv(
     w_t: &ArrayView2<f64>,    // (r × n)
     v_t: &ArrayView2<f64>,    // (p × n)
 ) -> Array2<f64> {
     let r = w_t.nrows();
-    let n = w_t.ncols();
     let p = v_t.nrows();
     let mut wtv = Array2::<f64>::zeros((r, p));
 
-    // Parallelise over output columns (= columns of V).
-    wtv.axis_iter_mut(Axis(1)).into_par_iter().enumerate().for_each(
-        |(u, mut col)| {
-            let v_t_row_u = v_t.row(u);
-            for k in 0..r {
-                let w_t_row_k = w_t.row(k);
-                let mut s = 0.0f64;
-                for i in 0..n {
-                    s += w_t_row_k[i] * v_t_row_u[i];
-                }
-                col[k] = s;
-            }
-        },
-    );
+    // Split output rows of V_t into chunks (= columns of WtV). Each chunk
+    // does its own gemm; chunks are independent so rayon parallelises them.
+    let n_threads = rayon::current_num_threads().max(1);
+    let chunk_size = ((p + n_threads - 1) / n_threads).max(64);
+    wtv.axis_chunks_iter_mut(Axis(1), chunk_size)
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(idx, mut chunk)| {
+            let col_start = idx * chunk_size;
+            let col_end = (col_start + chunk.ncols()).min(p);
+            // Slice v_t rows [col_start..col_end] (= corresponding cols of V).
+            let v_t_slice = v_t.slice(ndarray::s![col_start..col_end, ..]);
+            // chunk (r × chunk_w) = w_t (r × n) · v_t_slice^T (n × chunk_w)
+            let block = w_t.dot(&v_t_slice.t());
+            chunk.assign(&block);
+        });
+    let _ = r; // suppress unused if r-warning
     wtv
 }
 
-/// Compute V H^T. v is (n × p), h is (r × p), both row-major. Inner u-loop
-/// reads are stride-1 in both natively, no transpose needed.
+/// Compute V H^T via gemm + rayon row-chunking.
 fn compute_vht(v: &ArrayView2<f64>, h: &ArrayView2<f64>) -> Array2<f64> {
     let n = v.nrows();
-    let p = v.ncols();
     let r = h.nrows();
-    debug_assert_eq!(h.ncols(), p);
-
     let mut vht = Array2::<f64>::zeros((n, r));
-    vht.axis_iter_mut(Axis(0)).into_par_iter().enumerate().for_each(
-        |(i, mut row)| {
-            let v_row_i = v.row(i);
-            for k in 0..r {
-                let h_row_k = h.row(k);
-                let mut s = 0.0f64;
-                for u in 0..p {
-                    s += v_row_i[u] * h_row_k[u];
-                }
-                row[k] = s;
-            }
-        },
-    );
+
+    let n_threads = rayon::current_num_threads().max(1);
+    let chunk_size = ((n + n_threads - 1) / n_threads).max(64);
+    vht.axis_chunks_iter_mut(Axis(0), chunk_size)
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(idx, mut chunk)| {
+            let row_start = idx * chunk_size;
+            let row_end = (row_start + chunk.nrows()).min(n);
+            let v_slice = v.slice(ndarray::s![row_start..row_end, ..]);
+            let block = v_slice.dot(&h.t());
+            chunk.assign(&block);
+        });
     vht
 }
 
 /// Compute W^T W (r × r) from pre-transposed W^T (r × n).
 fn compute_wtw_from_wt(w_t: &ArrayView2<f64>) -> Array2<f64> {
+    // r × r is tiny; gemm overhead dominates so we keep the scalar version.
     let r = w_t.nrows();
     let n = w_t.ncols();
     let mut wtw = Array2::<f64>::zeros((r, r));
