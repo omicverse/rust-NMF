@@ -16,7 +16,6 @@ to absorb any cross-platform fma/order quirks.
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -26,7 +25,12 @@ import pytest
 import nmf_rs
 
 DATA_DIR = Path(__file__).parent / "data"
-RSCRIPT = "/scratch/users/steorra/env/CMAP/bin/Rscript"
+# Override the path to Rscript via NMF_RS_RSCRIPT for environments where R
+# isn't on the default PATH. Defaults match the local Sherlock CMAP env so
+# ad-hoc local runs Just Work; CI sets the env var to plain `Rscript`.
+RSCRIPT = os.environ.get(
+    "NMF_RS_RSCRIPT", "/scratch/users/steorra/env/CMAP/bin/Rscript"
+)
 REF_GEN = Path(__file__).parent / "reference_nmf.R"
 
 # Test parameters — must match what reference_nmf.R was invoked with.
