@@ -685,6 +685,278 @@ fn nmf_run_hals(
 }
 
 // =============================================================================
+// lsNMF (Wang, Kossenkov, Ochs 2006) — weighted Frobenius
+// =============================================================================
+//
+// Minimises  ||(V - WH) ⊙ Σ||_F²  for a per-entry weight matrix Σ.
+// Common use case: missing-value imputation by setting Σ[i,j]=0 where V[i,j]
+// is missing; the entry contributes nothing to the loss.
+//
+// Update rules from R `nmf_update.lsnmf`:
+//   wV  = V ⊙ Σ                                    (precomputed, constant)
+//   est = W H                                      (per iter)
+//   wE  = est ⊙ Σ
+//   numH = W^T (V ⊙ Σ)        denH = W^T (est ⊙ Σ)
+//   H ← max(eps, H ⊙ numH) / (denH + eps)
+//   numW = (V ⊙ Σ) H^T        denW = (est ⊙ Σ) H^T
+//   W ← max(eps, W ⊙ numW) / (denW + eps)
+//
+// Note: R's lsNMF uses BLAS gemm under the hood, so even R isn't bit-exact
+// across BLAS implementations. We compute the gemms with our cache-friendly
+// kernels in a fixed order.
+
+fn elementwise_mul(a: &ArrayView2<f64>, b: &ArrayView2<f64>) -> Array2<f64> {
+    let (n, p) = a.dim();
+    debug_assert_eq!(b.dim(), (n, p));
+    let mut out = Array2::<f64>::zeros((n, p));
+    for u in 0..n {
+        let a_row = a.row(u);
+        let b_row = b.row(u);
+        let mut o_row = out.row_mut(u);
+        for j in 0..p {
+            o_row[j] = a_row[j] * b_row[j];
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nmf_run_lsnmf(
+    v: &ArrayView2<f64>,
+    weight: &ArrayView2<f64>,
+    mut w: Array2<f64>,
+    mut h: Array2<f64>,
+    max_iter: usize,
+    eps: f64,
+    stop: Stop,
+    stationary_th: f64,
+    check_interval: usize,
+    check_niter: usize,
+) -> (Array2<f64>, Array2<f64>, usize, Vec<f64>) {
+    debug_assert_eq!(weight.dim(), v.dim());
+    let mut deviances: Vec<f64> = Vec::new();
+    let mut stationary = StationaryStop::new(check_interval, check_niter, stationary_th);
+
+    // Pre-multiply target by weight once — this is the "wX" of R's lsNMF.
+    let v_w = elementwise_mul(v, weight);
+    let v_w_t = transpose_owned(&v_w.view());   // for cache-friendly W^T V_w
+
+    if let Stop::Stationary = stop {
+        // Weighted reconstruction loss: 0.5 * ||(V - WH) ⊙ weight||²
+        let est = wh_dense(&w.view(), &h.view());
+        let mut s = 0.0f64;
+        for u in 0..v.nrows() {
+            for j in 0..v.ncols() {
+                let d = (v[(u, j)] - est[(u, j)]) * weight[(u, j)];
+                s += d * d;
+            }
+        }
+        let d = 0.5 * s;
+        deviances.push(d);
+        if stationary.should_stop(0, d) {
+            return (w, h, 0, deviances);
+        }
+    }
+
+    let mut iter = 0usize;
+    while iter < max_iter {
+        iter += 1;
+
+        // ----- H update -----
+        let est = wh_dense(&w.view(), &h.view());
+        let est_w = elementwise_mul(&est.view(), weight);
+        let est_w_t = transpose_owned(&est_w.view());
+
+        let w_t = transpose_owned(&w.view());
+        // numer_h = W^T V_w  (r × p)
+        let numer_h = compute_wtv(&w_t.view(), &v_w_t.view());
+        // denom_h = W^T est_w (r × p)
+        let denom_h = compute_wtv(&w_t.view(), &est_w_t.view());
+
+        // h ← max(h * numer_h, eps) / (denom_h + eps)
+        let r_ = h.nrows();
+        let p_ = h.ncols();
+        for k in 0..r_ {
+            for u in 0..p_ {
+                let temp = h[(k, u)] * numer_h[(k, u)];
+                let num = if temp > eps { temp } else { eps };
+                h[(k, u)] = num / (denom_h[(k, u)] + eps);
+            }
+        }
+
+        // ----- W update (recompute est now that H changed) -----
+        let est = wh_dense(&w.view(), &h.view());
+        let est_w = elementwise_mul(&est.view(), weight);
+
+        // numer_w = V_w H^T (n × r)
+        let numer_w = compute_vht(&v_w.view(), &h.view());
+        // denom_w = est_w H^T (n × r)
+        let denom_w = compute_vht(&est_w.view(), &h.view());
+
+        let n_ = w.nrows();
+        for u in 0..n_ {
+            for k in 0..r_ {
+                let temp = w[(u, k)] * numer_w[(u, k)];
+                let num = if temp > eps { temp } else { eps };
+                w[(u, k)] = num / (denom_w[(u, k)] + eps);
+            }
+        }
+
+        if let Stop::Stationary = stop {
+            let est = wh_dense(&w.view(), &h.view());
+            let mut s = 0.0f64;
+            for u in 0..v.nrows() {
+                for j in 0..v.ncols() {
+                    let d = (v[(u, j)] - est[(u, j)]) * weight[(u, j)];
+                    s += d * d;
+                }
+            }
+            let d = 0.5 * s;
+            deviances.push(d);
+            if stationary.should_stop(iter, d) {
+                break;
+            }
+        }
+    }
+    (w, h, iter, deviances)
+}
+
+// =============================================================================
+// Sparse HALS (snmf/r, snmf/l) — Kim-Park objective via regularised HALS
+// =============================================================================
+//
+// **NOT bit-equivalent to R's `snmf/r` / `snmf/l`**, which use FCNNLS-based
+// alternating NNLS (Van Benthem & Keenan 2004). We solve the closely related
+// regularised problem with HALS instead:
+//
+//   snmf/r:  min_{W,H}  ½ ||V - W H||² + γ_W ||W||² + λ_H Σ_j ||H_:,j||₁
+//   snmf/l:  min_{W,H}  ½ ||V - W H||² + γ_H ||H||² + λ_W Σ_i ||W_i,:||₁
+//
+// HALS update with these penalties (closed form per row/col):
+//
+//   For H: H[k, :] = max(eps, (W^T V - sum_{j≠k} (W^T W)[k,j] H[j,:] - λ_H 1)
+//                              / ((W^T W)[k,k] + γ_H))
+//   For W: W[:, k] = max(eps, (V H^T - sum_{j≠k} W[:, j] (H H^T)[j,k] - λ_W 1)
+//                              / ((H H^T)[k,k] + γ_W))
+//
+// The factorisation has the same sparsity-promoting effect as Kim-Park snmf,
+// just reached by a different optimiser. Use this when you need sparse
+// factors and don't need bit-equivalence with R.
+
+#[allow(clippy::too_many_arguments)]
+fn hals_update_h_reg(
+    h: &mut Array2<f64>,
+    wtv: &ArrayView2<f64>,
+    wtw: &ArrayView2<f64>,
+    lambda_h: f64,    // L1 coefficient on H
+    gamma_h: f64,     // L2 coefficient on H (added to wtw[k,k])
+    eps: f64,
+) {
+    let r = h.nrows();
+    h.axis_iter_mut(Axis(1)).into_par_iter().enumerate().for_each(
+        |(u, mut h_col)| {
+            for k in 0..r {
+                let mut s = wtv[(k, u)] - lambda_h;
+                for j in 0..r {
+                    if j != k {
+                        s -= wtw[(k, j)] * h_col[j];
+                    }
+                }
+                let denom = (wtw[(k, k)] + gamma_h).max(eps);
+                let val = s / denom;
+                h_col[k] = if val > eps { val } else { eps };
+            }
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hals_update_w_reg(
+    w: &mut Array2<f64>,
+    vht: &ArrayView2<f64>,
+    hht: &ArrayView2<f64>,
+    lambda_w: f64,    // L1 coefficient on W
+    gamma_w: f64,     // L2 coefficient on W
+    eps: f64,
+) {
+    let r = w.ncols();
+    w.axis_iter_mut(Axis(0)).into_par_iter().enumerate().for_each(
+        |(_i, mut w_row)| {
+            for k in 0..r {
+                let mut s = vht[(_i, k)] - lambda_w;
+                for j in 0..r {
+                    if j != k {
+                        s -= hht[(k, j)] * w_row[j];
+                    }
+                }
+                let denom = (hht[(k, k)] + gamma_w).max(eps);
+                let val = s / denom;
+                w_row[k] = if val > eps { val } else { eps };
+            }
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nmf_run_snmf(
+    v: &ArrayView2<f64>,
+    mut w: Array2<f64>,
+    mut h: Array2<f64>,
+    max_iter: usize,
+    eps: f64,
+    sparsity_h: f64,    // λ_H in snmf/r objective
+    sparsity_w: f64,    // λ_W in snmf/l objective
+    smoothness_h: f64,  // γ_H (L2 on H)
+    smoothness_w: f64,  // γ_W (L2 on W)
+    stop: Stop,
+    stationary_th: f64,
+    check_interval: usize,
+    check_niter: usize,
+) -> (Array2<f64>, Array2<f64>, usize, Vec<f64>) {
+    let mut deviances: Vec<f64> = Vec::new();
+    let mut stationary = StationaryStop::new(check_interval, check_niter, stationary_th);
+
+    let v_t = transpose_owned(v);
+
+    if let Stop::Stationary = stop {
+        let wh = wh_dense(&w.view(), &h.view());
+        let d = euclidean_distance(v, &wh.view());
+        deviances.push(d);
+        if stationary.should_stop(0, d) {
+            return (w, h, 0, deviances);
+        }
+    }
+
+    let mut iter = 0usize;
+    while iter < max_iter {
+        iter += 1;
+
+        // H sweep with L1-on-H + L2-on-H regularisation
+        let w_t = transpose_owned(&w.view());
+        let wtv = compute_wtv(&w_t.view(), &v_t.view());
+        let wtw = compute_wtw_from_wt(&w_t.view());
+        hals_update_h_reg(&mut h, &wtv.view(), &wtw.view(),
+                          sparsity_h, smoothness_h, eps);
+
+        // W sweep with L1-on-W + L2-on-W regularisation
+        let vht = compute_vht(v, &h.view());
+        let hht = compute_hht(&h.view());
+        hals_update_w_reg(&mut w, &vht.view(), &hht.view(),
+                          sparsity_w, smoothness_w, eps);
+
+        if let Stop::Stationary = stop {
+            let wh = wh_dense(&w.view(), &h.view());
+            let d = euclidean_distance(v, &wh.view());
+            deviances.push(d);
+            if stationary.should_stop(iter, d) {
+                break;
+            }
+        }
+    }
+    (w, h, iter, deviances)
+}
+
+// =============================================================================
 // Stopping criterion: stationary
 // =============================================================================
 
@@ -831,6 +1103,9 @@ pub enum Algo {
     Offset,
     NsNmf,
     Hals,
+    LsNmf,
+    SnmfR,
+    SnmfL,
 }
 
 impl Algo {
@@ -840,9 +1115,12 @@ impl Algo {
             "lee" | "frobenius" | "euclidean" => Ok(Algo::Lee),
             "offset" => Ok(Algo::Offset),
             "nsnmf" | "ns" | "ns_nmf" => Ok(Algo::NsNmf),
-            "hals" | "lsnmf" => Ok(Algo::Hals),
+            "hals" => Ok(Algo::Hals),
+            "ls-nmf" | "lsnmf" => Ok(Algo::LsNmf),
+            "snmf/r" | "snmf_r" | "snmfr" => Ok(Algo::SnmfR),
+            "snmf/l" | "snmf_l" | "snmfl" => Ok(Algo::SnmfL),
             other => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown algorithm '{}': supported: brunet, lee, offset, nsNMF, hals",
+                "unknown algorithm '{}': supported: brunet, lee, offset, nsNMF, hals, lsNMF, snmf/r, snmf/l",
                 other
             ))),
         }
@@ -1265,6 +1543,11 @@ fn py_euclidean_update_w<'py>(
     rescale = true,
     theta = 0.5,
     offset = None,
+    weight = None,
+    sparsity_h = 0.0,
+    sparsity_w = 0.0,
+    smoothness_h = 0.0,
+    smoothness_w = 0.0,
     stop = "max_iter",
     stationary_th = 2.220446049250313e-16,
     check_interval = 50,
@@ -1282,6 +1565,11 @@ fn py_nmf_run<'py>(
     rescale: bool,
     theta: f64,
     offset: Option<numpy::PyReadonlyArray1<'py, f64>>,
+    weight: Option<PyReadonlyArray2<'py, f64>>,
+    sparsity_h: f64,
+    sparsity_w: f64,
+    smoothness_h: f64,
+    smoothness_w: f64,
     stop: &str,
     stationary_th: f64,
     check_interval: usize,
@@ -1296,6 +1584,14 @@ fn py_nmf_run<'py>(
     let w_owned = w0.as_array().to_owned();
     let h_owned = h0.as_array().to_owned();
     let off0: Option<Array1<f64>> = offset.map(|o| o.as_array().to_owned());
+    let weight_owned: Option<Array2<f64>> = weight.map(|w| w.as_array().to_owned());
+
+    // Sanity check: lsNMF needs a weight matrix.
+    if matches!(algo, Algo::LsNmf) && weight_owned.is_none() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "method='lsnmf' requires a `weight` matrix of the same shape as V",
+        ));
+    }
 
     // Build a per-call thread pool when the caller wants explicit parallelism.
     // `pool.install(|| ...)` makes any rayon par_iter inside the closure use
@@ -1383,6 +1679,56 @@ fn py_nmf_run<'py>(
                     h_owned,
                     max_iter,
                     eps,
+                    stop,
+                    stationary_th,
+                    check_interval,
+                    check_niter,
+                );
+                (w, h, None, n, dev)
+            }
+            Algo::LsNmf => {
+                let weight = weight_owned.expect("weight checked above");
+                let (w, h, n, dev) = nmf_run_lsnmf(
+                    &v_view,
+                    &weight.view(),
+                    w_owned,
+                    h_owned,
+                    max_iter,
+                    eps,
+                    stop,
+                    stationary_th,
+                    check_interval,
+                    check_niter,
+                );
+                (w, h, None, n, dev)
+            }
+            Algo::SnmfR => {
+                // snmf/r: sparse H, smooth W (γ_W on W, λ_H on H rows).
+                let (w, h, n, dev) = nmf_run_snmf(
+                    &v_view,
+                    w_owned,
+                    h_owned,
+                    max_iter,
+                    eps,
+                    sparsity_h, 0.0,
+                    0.0, smoothness_w,
+                    stop,
+                    stationary_th,
+                    check_interval,
+                    check_niter,
+                );
+                (w, h, None, n, dev)
+            }
+            Algo::SnmfL => {
+                // snmf/l: sparse W, smooth H.
+                let (w, h, n, dev) = nmf_run_snmf(
+                    &v_view,
+                    w_owned,
+                    h_owned,
+                    max_iter,
+                    eps,
+                    0.0, sparsity_w,
+                    smoothness_h, 0.0,
                     stop,
                     stationary_th,
                     check_interval,

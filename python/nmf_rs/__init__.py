@@ -284,7 +284,14 @@ _METHOD_ALIASES = {
     "ns": "nsnmf",
     "ns_nmf": "nsnmf",
     "hals": "hals",
-    "lsnmf": "hals",
+    "ls-nmf": "lsnmf",
+    "lsnmf": "lsnmf",
+    "snmf/r": "snmf/r",
+    "snmf_r": "snmf/r",
+    "snmfr": "snmf/r",
+    "snmf/l": "snmf/l",
+    "snmf_l": "snmf/l",
+    "snmfl": "snmf/l",
 }
 
 
@@ -307,6 +314,9 @@ def nmf(
     rescale: bool = True,
     theta: float = 0.5,
     offset: Optional[np.ndarray] = None,
+    weight: Optional[np.ndarray] = None,
+    sparsity: float = 0.01,
+    smoothness: float = 1.0,
     stop: str = "max_iter",
     stationary_th: float = float(np.finfo(np.float64).eps),
     check_interval: int = 50,
@@ -321,9 +331,20 @@ def nmf(
         Non-negative target matrix. Will be coerced to ``float64``.
     rank : int
         Factorisation rank (number of components).
-    method : {'brunet', 'lee', 'offset', 'nsNMF'}, default 'brunet'
-        Multiplicative-update family. Aliases accepted: ``KL`` for brunet,
-        ``Frobenius``/``euclidean`` for lee, ``ns``/``ns_nmf`` for nsNMF.
+    method : {'brunet', 'lee', 'offset', 'nsNMF', 'hals', 'ls-nmf',
+              'snmf/r', 'snmf/l'}, default 'brunet'
+        Multiplicative-update family.
+
+        - ``brunet`` / ``KL`` — KL-divergence updates, R-parity bit-equiv.
+        - ``lee`` / ``Frobenius`` / ``euclidean`` — Lee/Seung Frobenius, R-parity.
+        - ``offset`` — Lee + per-feature offset (Badea 2008), R-parity.
+        - ``nsNMF`` — Brunet + smoothing matrix (Pascual-Montano 2006), R-parity.
+        - ``hals`` — Cichocki-Phan least-squares; ~10× fewer iterations needed.
+        - ``ls-nmf`` (alias ``lsnmf``) — weighted Lee (Wang 2006); requires
+          ``weight=`` of shape V. Useful for masking missing data.
+        - ``snmf/r`` / ``snmf/l`` — sparse-H / sparse-W via regularised HALS,
+          NOT bit-equivalent to R's FCNNLS-based snmf but achieves the same
+          sparsity goal. Tune via ``sparsity=`` and ``smoothness=``.
     W0, H0 : array, optional
         Initial factor matrices. If not provided, ``random_init`` is used
         with ``seed``. **For bit-equivalence with R, pass W0/H0 generated
@@ -341,6 +362,15 @@ def nmf(
     offset : (n,) array, optional
         Initial offset vector for ``method='offset'``. Defaults to
         ``rowMeans(V)`` to match R.
+    weight : (n, p) array, optional
+        Per-entry weight matrix for ``method='ls-nmf'``. Set
+        ``weight[i, j] = 0`` to mask V[i, j] (missing-value imputation).
+    sparsity : float, default 0.01
+        L1 penalty coefficient for ``method='snmf/r'`` (applied to H) or
+        ``'snmf/l'`` (applied to W). Larger → sparser factors.
+    smoothness : float, default 1.0
+        L2 penalty coefficient for ``method='snmf/r'`` (applied to W) or
+        ``'snmf/l'`` (applied to H). Helps regularise the non-sparse factor.
     stop : {'max_iter', 'stationary'}
         ``'stationary'`` replicates R `nmf.stop.stationary` semantics.
     stationary_th, check_interval, check_niter
@@ -388,6 +418,14 @@ def nmf(
         if offset_arr.shape != (n,):
             raise ValueError(f"offset.shape {offset_arr.shape} != ({n},)")
 
+    weight_arr = None
+    if weight is not None:
+        weight_arr = np.ascontiguousarray(np.asarray(weight, dtype=np.float64))
+        if weight_arr.shape != V_arr.shape:
+            raise ValueError(
+                f"weight.shape {weight_arr.shape} != V.shape {V_arr.shape}"
+            )
+
     out = _nmf_run(
         method_norm,
         V_arr,
@@ -398,6 +436,11 @@ def nmf(
         rescale=bool(rescale),
         theta=float(theta),
         offset=offset_arr,
+        weight=weight_arr,
+        sparsity_h=float(sparsity) if method_norm == "snmf/r" else 0.0,
+        sparsity_w=float(sparsity) if method_norm == "snmf/l" else 0.0,
+        smoothness_h=float(smoothness) if method_norm == "snmf/l" else 0.0,
+        smoothness_w=float(smoothness) if method_norm == "snmf/r" else 0.0,
         stop=stop,
         stationary_th=float(stationary_th),
         check_interval=int(check_interval),

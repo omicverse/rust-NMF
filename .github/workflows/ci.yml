@@ -50,7 +50,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pytest numpy
-          pip install -e . --config-settings=build-args='--release'
+          pip install -e .
       - name: Smoke test (no R reference fixture available in CI)
         run: |
           python - <<'PY'
@@ -92,7 +92,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pytest numpy
-          pip install -e . --config-settings=build-args='--release'
+          pip install -e .
       - name: Run parity tests
         env:
           # Override the path the parity test hard-codes for the local Sherlock layout.

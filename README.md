@@ -81,14 +81,21 @@ See `tests/test_parity.py` for the end-to-end pytest suite.
 
 ## Algorithms
 
-| `method`   | R equivalent | Update rule                                   |
-|------------|--------------|-----------------------------------------------|
-| `brunet`   | `nmf_update.brunet` | KL divergence, every-10-iter eps clamp |
-| `lee`      | `nmf_update.lee`    | Frobenius/Euclidean, optional col rescale |
-| `offset`   | `nmf_update.offset` | Lee + offset vector (Badea 2008) |
-| `nsNMF`    | `nmf_update.ns`     | Brunet with smoothing matrix (theta) |
+| `method`   | R equivalent | Update rule | Bit-eq with R |
+|------------|--------------|-------------|---------------|
+| `brunet`   | `nmf_update.brunet` | KL divergence, every-10-iter eps clamp | yes |
+| `lee`      | `nmf_update.lee`    | Frobenius/Euclidean, optional col rescale | yes |
+| `offset`   | `nmf_update.offset` | Lee + offset vector (Badea 2008) | yes |
+| `nsNMF`    | `nmf_update.ns`     | Brunet with smoothing matrix (theta) | yes |
+| `ls-nmf`   | `nmf_update.lsnmf`  | Weighted Frobenius (Wang 2006); pass `weight=` | within BLAS round-off |
+| `hals`     | (none — Cichocki-Phan) | Block-coord LS; ~10× fewer iters | no (custom) |
+| `snmf/r`   | `nmf_snmf` (Kim-Park) | Sparse-H via reg. HALS; tune `sparsity=`, `smoothness=` | no (FCNNLS replaced) |
+| `snmf/l`   | `nmf_snmf` (Kim-Park) | Sparse-W via reg. HALS | no (FCNNLS replaced) |
 
-`lsNMF`, `snmf/r`, `snmf/l` are not yet ported.
+The four "yes" rows match R within f64 epsilon (~1e-12). `ls-nmf` matches up
+to BLAS-summation variance (R itself isn't stable across BLAS impls). `hals`
+is a different algorithm; `snmf/r`/`snmf/l` solve a closely-related sparse
+factorisation problem with regularised HALS instead of R's FCNNLS-based ANLS.
 
 ## License
 

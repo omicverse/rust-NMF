@@ -6,6 +6,14 @@ All notable changes to `nmf-rs` are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+- `method='ls-nmf'` (alias `lsnmf`): weighted Frobenius (Wang 2006) — pass
+  `weight=` of the same shape as `V`. Useful for missing-value imputation
+  via `weight[i, j] = 0` for masked entries.
+- `method='snmf/r'` and `'snmf/l'`: sparse-H / sparse-W via regularised HALS
+  with `sparsity=` (L1 coefficient) and `smoothness=` (L2). NOT bit-equivalent
+  to R's FCNNLS-based `snmf/r` / `snmf/l`, but achieves the same sparsity goal.
+
 ## [0.1.0] — initial release
 
 ### Added
