@@ -1,0 +1,42 @@
+[build-system]
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "nmf-rs"
+version = "0.1.0"
+description = "Rust port of R NMF package — bit-equivalent multiplicative updates (brunet/lee/offset/nsNMF), parallelised with rayon."
+readme = "README.md"
+license = {text = "GPL-2.0-or-later"}
+requires-python = ">=3.9"
+authors = [
+    {name = "Zehua Zeng", email = "starlitnightly@163.com"},
+]
+keywords = ["NMF", "nonnegative-matrix-factorization", "single-cell", "rust"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: GNU General Public License v2 or later (GPLv2+)",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "numpy>=1.23",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "scipy>=1.10",
+    "pandas>=1.5",
+    "anndata>=0.9",
+    "scikit-learn>=1.2",
+]
+
+[tool.maturin]
+manifest-path = "rust/Cargo.toml"
+features = ["pyo3/extension-module"]
+module-name = "nmf_rs._rust"
+python-source = "python"
+include = [
+    { path = "LICENSE", format = ["sdist", "wheel"] },
+]

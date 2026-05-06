@@ -1,0 +1,47 @@
+# Rust build artifacts
+rust/target/
+target/
+**/*.rs.bk
+*.pdb
+
+# Python build/install
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.whl
+
+# Maturin/PyO3 generated extension lives in python/nmf_rs/_rust.abi3.so —
+# explicitly include the package dir but exclude the compiled .so:
+!python/
+python/nmf_rs/_rust.abi3.so
+
+# Editor/OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+.ipynb_checkpoints/
+
+# Bench scratch & throw-away helpers (notebook regenerators are kept;
+# one-off _* scripts are not).
+examples/pbmc_bench/
+examples/tutorial_work/
+examples/_*.py
+tests/data/
+*.tsv
+
+# Allow tracked Rscript fixtures
+!tests/reference_nmf.R
+
+# Cargo lock kept (binary crate)
+!rust/Cargo.lock

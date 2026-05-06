@@ -1,0 +1,6 @@
+This package contains a Rust port of the R `NMF` package
+(https://github.com/renozao/NMF), which is licensed under GPL (>=2).
+This port is therefore distributed under the same license.
+
+  GNU General Public License, version 2 or any later version.
+  https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt
