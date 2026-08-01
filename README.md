@@ -52,6 +52,43 @@ res = nmf(V, rank=20, method='hals',
           W0=W0, H0=H0, max_iter=25, num_threads=16)
 ```
 
+## Fixed-factor Brunet for Spatial EcoTyper
+
+Version 0.2 adds full-loop fixed-factor APIs for supervised training and
+projection.  Each call stays in Rust for all iterations, releases the Python
+GIL, caches invariant transposes and row/column sums, and can use a scoped
+Rayon pool without changing the global thread setting:
+
+```python
+from nmf_rs import fixed_h_brunet, fixed_w_brunet
+
+# Train W while the labelled coefficient matrix H is byte-for-byte fixed.
+W, train_metrics = fixed_h_brunet(
+    V, H_fixed, W0,
+    max_iter=2000, check_interval=10, stopconv=40, num_threads=6,
+)
+
+# Project new observations into a byte-for-byte fixed basis W.
+H, projection_metrics = fixed_w_brunet(
+    V_new, W_fixed, H0,
+    max_iter=2000, check_interval=10, stopconv=40, num_threads=6,
+)
+```
+
+Both functions preserve float64 Brunet/KL updates and R NMF's fixed-factor
+contract: machine-epsilon flooring every 10 iterations, connectivity checks
+at `check_interval`, and the strict stop condition
+`stable_connectivity_checks > stopconv`.  With the defaults, stable
+connectivity can therefore first stop at iteration 420.  The returned metrics
+include iteration counts, connectivity diagnostics, final KL objective,
+threads used, and SHA-256 before/after attestation for the fixed factor.
+
+Run the loop-overhead benchmark with:
+
+```bash
+python examples/benchmark_fixed_factor.py --operation fixed-w --iterations 420
+```
+
 ## Algorithm catalogue
 
 | `method` | Origin | Year | Update rule | Bit-eq R | Best for |
