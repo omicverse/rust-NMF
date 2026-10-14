@@ -6,7 +6,14 @@ All notable changes to `nmf-rs` are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-01
+
 ### Added
+- `fixed_h_brunet(V, H_fixed, W0, ...)` and
+  `fixed_w_brunet(V, W_fixed, H0, ...)` full-loop APIs for Spatial EcoTyper.
+- R NMF connectivity stopping diagnostics, fixed-factor SHA-256 attestation,
+  scoped per-call Rayon thread pools, and final KL objective metrics.
+- Python/Rust fixed-factor contract tests and a loop-overhead benchmark.
 - `method='ls-nmf'` (alias `lsnmf`): weighted Frobenius (Wang 2006) — pass
   `weight=` of the same shape as `V`. Useful for missing-value imputation
   via `weight[i, j] = 0` for masked entries.

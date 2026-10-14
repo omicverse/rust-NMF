@@ -9,6 +9,8 @@ Public API
     Run a full NMF factorisation and return an NMFResult.
 - update_h_brunet(V, W, H), update_w_brunet(V, W, H)
     Single-step KL multiplicative updates (matches R `std.divergence.update.{h,w}`).
+- fixed_h_brunet(V, H_fixed, W0), fixed_w_brunet(V, W_fixed, H0)
+    Full fixed-factor Brunet loops with R NMF connectivity stopping.
 - update_h_lee(V, W, H, eps=1e-9), update_w_lee(V, W, H, eps=1e-9)
     Single-step Frobenius multiplicative updates (matches R `std.euclidean.update.{h,w}`).
 - random_init(V, rank, seed) → (W0, H0) using R's runif() Mersenne Twister.
@@ -27,6 +29,8 @@ try:
         py_divergence_update_w as _div_w,
         py_euclidean_update_h as _euc_h,
         py_euclidean_update_w as _euc_w,
+        py_fixed_h_brunet as _fixed_h_brunet,
+        py_fixed_w_brunet as _fixed_w_brunet,
         py_nmf_run as _nmf_run,
         py_smoothing_matrix as _smoothing_matrix,
         set_num_threads as _set_num_threads,
@@ -34,7 +38,9 @@ try:
     _RUST_AVAILABLE = True
 except ImportError:
     _RUST_AVAILABLE = False
-    _div_h = _div_w = _euc_h = _euc_w = _nmf_run = _smoothing_matrix = _set_num_threads = None
+    _div_h = _div_w = _euc_h = _euc_w = None
+    _fixed_h_brunet = _fixed_w_brunet = None
+    _nmf_run = _smoothing_matrix = _set_num_threads = None
 
 
 __all__ = [
@@ -42,6 +48,8 @@ __all__ = [
     "nmf",
     "update_h_brunet",
     "update_w_brunet",
+    "fixed_h_brunet",
+    "fixed_w_brunet",
     "update_h_lee",
     "update_w_lee",
     "smoothing_matrix",
@@ -250,6 +258,77 @@ def update_w_brunet(V: np.ndarray, W: np.ndarray, H: np.ndarray) -> np.ndarray:
     """Single Brunet (KL) update of W. Matches R `std.divergence.update.w`."""
     _check_rust()
     return _div_w(_f64_c(V, "V"), _f64_c(W, "W"), _f64_c(H, "H"))
+
+
+def fixed_h_brunet(
+    V: np.ndarray,
+    H_fixed: np.ndarray,
+    W0: np.ndarray,
+    *,
+    max_iter: int = 2000,
+    check_interval: int = 10,
+    stopconv: int = 40,
+    num_threads: Optional[int] = None,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Fit W with H fixed using a complete Rust Brunet/KL loop.
+
+    The fixed factor is copied into Rust and never updated.  The updated W is
+    floored at ``float64`` machine epsilon every ten iterations.  Connectivity
+    is checked every ``check_interval`` iterations and uses R NMF's strict
+    ``stable_checks > stopconv`` condition (defaults first permit a stop at
+    iteration 420).
+
+    Returns
+    -------
+    (W, metrics)
+        ``metrics`` records iterations, connectivity convergence, KL
+        objective, fixed-factor SHA-256 attestation, and threads used.
+    """
+    _check_rust()
+    factor, metrics = _fixed_h_brunet(
+        _f64_c(V, "V"),
+        _f64_c(H_fixed, "H_fixed"),
+        _f64_c(W0, "W0"),
+        int(max_iter),
+        check_interval=int(check_interval),
+        stopconv=int(stopconv),
+        num_threads=int(num_threads) if num_threads is not None else None,
+    )
+    return np.asarray(factor), dict(metrics)
+
+
+def fixed_w_brunet(
+    V: np.ndarray,
+    W_fixed: np.ndarray,
+    H0: np.ndarray,
+    *,
+    max_iter: int = 2000,
+    check_interval: int = 10,
+    stopconv: int = 40,
+    num_threads: Optional[int] = None,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Fit H with W fixed using a complete Rust Brunet/KL loop.
+
+    This is the projection counterpart to :func:`fixed_h_brunet`; it caches
+    ``V.T``, ``W.T`` and W column sums once for the entire call and follows the
+    same R NMF flooring and connectivity-stopping semantics.
+
+    Returns
+    -------
+    (H, metrics)
+        The projected coefficient matrix and structured run metrics.
+    """
+    _check_rust()
+    factor, metrics = _fixed_w_brunet(
+        _f64_c(V, "V"),
+        _f64_c(W_fixed, "W_fixed"),
+        _f64_c(H0, "H0"),
+        int(max_iter),
+        check_interval=int(check_interval),
+        stopconv=int(stopconv),
+        num_threads=int(num_threads) if num_threads is not None else None,
+    )
+    return np.asarray(factor), dict(metrics)
 
 
 def update_h_lee(V: np.ndarray, W: np.ndarray, H: np.ndarray, eps: float = 1e-9) -> np.ndarray:

@@ -15,6 +15,7 @@ use ndarray::{Array1, Array2, ArrayView2, Axis};
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
 use pyo3::prelude::*;
 use rayon::prelude::*;
+use sha2::{Digest, Sha256};
 
 mod fcnnls;
 
@@ -197,6 +198,52 @@ fn divergence_update_w_impl(
                     tmp += h[(j, u)] * wh_row[u];
                 }
                 wp_row[j] = w[(i, j)] * tmp / sum_h[j];
+            }
+        },
+    );
+    wp
+}
+
+/// Brunet W update using H-derived data cached by a fixed-H driver.
+/// The arithmetic and reduction order match `divergence_update_w_impl`.
+fn divergence_update_w_cached_h(
+    v: &ArrayView2<f64>,
+    w: &ArrayView2<f64>,
+    h: &ArrayView2<f64>,
+    h_t: &ArrayView2<f64>,
+    sum_h: &[f64],
+) -> Array2<f64> {
+    let n = w.nrows();
+    let r = w.ncols();
+    let p = h.ncols();
+    debug_assert_eq!(v.shape(), &[n, p]);
+    debug_assert_eq!(h_t.shape(), &[p, r]);
+    debug_assert_eq!(sum_h.len(), r);
+
+    let mut wp = Array2::<f64>::zeros((n, r));
+    wp.axis_iter_mut(Axis(0)).into_par_iter().enumerate().for_each(
+        |(i, mut wp_row)| {
+            // Fuse the V/(WH) pass with the H-weighted reductions.  Each
+            // accumulator still visits u=0..p in R's exact scalar order, but
+            // we avoid allocating/re-reading an intermediate length-p row and
+            // consume cached H^T contiguously.
+            let mut numerators = vec![0.0f64; r];
+            for u in 0..p {
+                let mut wh_iu = 0.0f64;
+                for k in 0..r {
+                    wh_iu += w[(i, k)] * h_t[(u, k)];
+                }
+                let ratio = if wh_iu != 0.0 {
+                    v[(i, u)] / wh_iu
+                } else {
+                    0.0
+                };
+                for j in 0..r {
+                    numerators[j] += h_t[(u, j)] * ratio;
+                }
+            }
+            for j in 0..r {
+                wp_row[j] = w[(i, j)] * numerators[j] / sum_h[j];
             }
         },
     );
@@ -1457,6 +1504,312 @@ fn pmax_inplace(x: &mut ndarray::Array2<f64>, eps: f64) {
     }
 }
 
+const FIXED_FACTOR_EPS_FLOOR_INTERVAL: usize = 10;
+
+#[derive(Clone, Debug)]
+struct FixedFactorRunMetrics {
+    operation: &'static str,
+    update_function: &'static str,
+    iterations: usize,
+    max_iter: usize,
+    check_interval: usize,
+    stopconv: usize,
+    connectivity_checks: usize,
+    stable_connectivity_checks: usize,
+    converged: bool,
+    eps_floor_applications: usize,
+    objective_kl: f64,
+    fixed_factor_name: &'static str,
+    fixed_factor_shape: (usize, usize),
+    fixed_factor_sha256_before: String,
+    fixed_factor_sha256_after: String,
+    num_threads: usize,
+}
+
+#[derive(Clone, Debug)]
+struct FixedFactorRunOutcome {
+    factor: Array2<f64>,
+    metrics: FixedFactorRunMetrics,
+}
+
+/// Stable SHA-256 over a matrix's logical C-order float64 values.
+fn matrix_sha256(matrix: &ArrayView2<f64>) -> String {
+    let mut digest = Sha256::new();
+    for i in 0..matrix.nrows() {
+        for j in 0..matrix.ncols() {
+            digest.update(matrix[(i, j)].to_le_bytes());
+        }
+    }
+    format!("{:x}", digest.finalize())
+}
+
+/// Label-permutation-invariant encoding of NMF connectivity.
+///
+/// R NMF compares the connectivity matrices induced by `max.col(t(H))`.
+/// Materialising a p-by-p matrix is unnecessary: two connectivity matrices
+/// are equal exactly when their canonicalised partitions are equal.
+fn canonical_connectivity_partition(h: &ArrayView2<f64>) -> Vec<usize> {
+    let rank = h.nrows();
+    let observations = h.ncols();
+    let mut canonical_labels = vec![usize::MAX; rank];
+    let mut next_label = 0usize;
+    let mut partition = Vec::with_capacity(observations);
+
+    for observation in 0..observations {
+        // Strict `>` preserves R's ties.method="first" behaviour.
+        let mut assignment = 0usize;
+        let mut maximum = h[(0, observation)];
+        for component in 1..rank {
+            let candidate = h[(component, observation)];
+            if candidate > maximum {
+                maximum = candidate;
+                assignment = component;
+            }
+        }
+        if canonical_labels[assignment] == usize::MAX {
+            canonical_labels[assignment] = next_label;
+            next_label += 1;
+        }
+        partition.push(canonical_labels[assignment]);
+    }
+    partition
+}
+
+/// Generalised KL objective without allocating the dense W*H product.
+/// Parallel row traversal keeps V and W reads contiguous; collecting partials
+/// before the final sum also makes the diagnostic deterministic across thread
+/// counts.
+fn product_kl_divergence(
+    v: &ArrayView2<f64>,
+    w: &ArrayView2<f64>,
+    h: &ArrayView2<f64>,
+) -> f64 {
+    let n = v.nrows();
+    let p = v.ncols();
+    let rank = w.ncols();
+    let row_objectives: Vec<f64> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let mut row_objective = 0.0f64;
+            for j in 0..p {
+                let mut estimate = 0.0f64;
+                for k in 0..rank {
+                    estimate += w[(i, k)] * h[(k, j)];
+                }
+                let value = v[(i, j)];
+                if value > 0.0 {
+                    // Match R NMF's KL semantics exactly: a positive target
+                    // with a zero reconstruction has infinite divergence.
+                    if estimate == 0.0 {
+                        return f64::INFINITY;
+                    }
+                    row_objective += value * (value.ln() - estimate.ln()) - value + estimate;
+                } else {
+                    row_objective += estimate;
+                }
+            }
+            row_objective
+        })
+        .collect();
+    row_objectives.into_iter().sum()
+}
+
+fn validate_updated_fixed_factor(factor: &ArrayView2<f64>, name: &str) -> Result<(), String> {
+    if factor.iter().any(|value| !value.is_finite() || *value < 0.0) {
+        return Err(format!(
+            "{} update produced negative or non-finite values",
+            name
+        ));
+    }
+    Ok(())
+}
+
+/// Fit W while H remains fixed, using only the Brunet KL W update.
+fn fixed_h_brunet_run(
+    v: &ArrayView2<f64>,
+    h_fixed: &ArrayView2<f64>,
+    mut w: Array2<f64>,
+    max_iter: usize,
+    check_interval: usize,
+    stopconv: usize,
+) -> Result<FixedFactorRunOutcome, String> {
+    let rank = h_fixed.nrows();
+    let observations = h_fixed.ncols();
+    let fixed_sha256_before = matrix_sha256(h_fixed);
+
+    // H never changes: cache both its transpose and row sums once.
+    let h_t = transpose_owned(h_fixed);
+    let mut sum_h = vec![0.0f64; rank];
+    for k in 0..rank {
+        let mut sum = 0.0f64;
+        for j in 0..observations {
+            sum += h_fixed[(k, j)];
+        }
+        sum_h[k] = sum;
+    }
+
+    let mut previous_partition: Option<Vec<usize>> = None;
+    let mut stable_checks = 0usize;
+    let mut connectivity_checks = 0usize;
+    let mut eps_floor_applications = 0usize;
+    let mut converged = false;
+    let mut iterations = 0usize;
+
+    while iterations < max_iter {
+        iterations += 1;
+        w = divergence_update_w_cached_h(
+            v,
+            &w.view(),
+            h_fixed,
+            &h_t.view(),
+            &sum_h,
+        );
+        validate_updated_fixed_factor(&w.view(), "W")?;
+
+        if iterations % FIXED_FACTOR_EPS_FLOOR_INTERVAL == 0 {
+            pmax_inplace(&mut w, f64::EPSILON);
+            eps_floor_applications += 1;
+        }
+
+        if iterations % check_interval == 0 {
+            connectivity_checks += 1;
+            let partition = canonical_connectivity_partition(h_fixed);
+            if previous_partition.as_ref() == Some(&partition) {
+                stable_checks += 1;
+            } else {
+                stable_checks = 0;
+                previous_partition = Some(partition);
+            }
+            // R NMF deliberately uses strict greater-than, so the defaults
+            // first stop at check 42 / iteration 420, not at iteration 410.
+            if stable_checks > stopconv {
+                converged = true;
+                break;
+            }
+        }
+    }
+
+    let fixed_sha256_after = matrix_sha256(h_fixed);
+    let objective_kl = product_kl_divergence(v, &w.view(), h_fixed);
+    if !objective_kl.is_finite() {
+        return Err("fixed-H Brunet run produced a non-finite KL objective".to_string());
+    }
+    Ok(FixedFactorRunOutcome {
+        factor: w,
+        metrics: FixedFactorRunMetrics {
+            operation: "train_fixed_h",
+            update_function: "update_w_brunet",
+            iterations,
+            max_iter,
+            check_interval,
+            stopconv,
+            connectivity_checks,
+            stable_connectivity_checks: stable_checks,
+            converged,
+            eps_floor_applications,
+            objective_kl,
+            fixed_factor_name: "H",
+            fixed_factor_shape: h_fixed.dim(),
+            fixed_factor_sha256_before: fixed_sha256_before,
+            fixed_factor_sha256_after: fixed_sha256_after,
+            num_threads: rayon::current_num_threads(),
+        },
+    })
+}
+
+/// Fit H while W remains fixed, using only the Brunet KL H update.
+fn fixed_w_brunet_run(
+    v: &ArrayView2<f64>,
+    w_fixed: &ArrayView2<f64>,
+    mut h: Array2<f64>,
+    max_iter: usize,
+    check_interval: usize,
+    stopconv: usize,
+) -> Result<FixedFactorRunOutcome, String> {
+    let n = w_fixed.nrows();
+    let rank = w_fixed.ncols();
+    let fixed_sha256_before = matrix_sha256(w_fixed);
+
+    // V and W never change: all expensive transposes and W column sums are
+    // invariant across the full projection loop.
+    let v_t = transpose_owned(v);
+    let w_t = transpose_owned(w_fixed);
+    let mut sum_w = vec![0.0f64; rank];
+    for k in 0..rank {
+        let mut sum = 0.0f64;
+        for i in 0..n {
+            sum += w_fixed[(i, k)];
+        }
+        sum_w[k] = sum;
+    }
+
+    let mut previous_partition: Option<Vec<usize>> = None;
+    let mut stable_checks = 0usize;
+    let mut connectivity_checks = 0usize;
+    let mut eps_floor_applications = 0usize;
+    let mut converged = false;
+    let mut iterations = 0usize;
+
+    while iterations < max_iter {
+        iterations += 1;
+        h = divergence_update_h_inner(
+            &v_t.view(),
+            w_fixed,
+            &w_t.view(),
+            &h.view(),
+            &sum_w,
+        );
+        validate_updated_fixed_factor(&h.view(), "H")?;
+
+        if iterations % FIXED_FACTOR_EPS_FLOOR_INTERVAL == 0 {
+            pmax_inplace(&mut h, f64::EPSILON);
+            eps_floor_applications += 1;
+        }
+
+        if iterations % check_interval == 0 {
+            connectivity_checks += 1;
+            let partition = canonical_connectivity_partition(&h.view());
+            if previous_partition.as_ref() == Some(&partition) {
+                stable_checks += 1;
+            } else {
+                stable_checks = 0;
+                previous_partition = Some(partition);
+            }
+            if stable_checks > stopconv {
+                converged = true;
+                break;
+            }
+        }
+    }
+
+    let fixed_sha256_after = matrix_sha256(w_fixed);
+    let objective_kl = product_kl_divergence(v, w_fixed, &h.view());
+    if !objective_kl.is_finite() {
+        return Err("fixed-W Brunet run produced a non-finite KL objective".to_string());
+    }
+    Ok(FixedFactorRunOutcome {
+        factor: h,
+        metrics: FixedFactorRunMetrics {
+            operation: "project_fixed_w",
+            update_function: "update_h_brunet",
+            iterations,
+            max_iter,
+            check_interval,
+            stopconv,
+            connectivity_checks,
+            stable_connectivity_checks: stable_checks,
+            converged,
+            eps_floor_applications,
+            objective_kl,
+            fixed_factor_name: "W",
+            fixed_factor_shape: w_fixed.dim(),
+            fixed_factor_sha256_before: fixed_sha256_before,
+            fixed_factor_sha256_after: fixed_sha256_after,
+            num_threads: rayon::current_num_threads(),
+        },
+    })
+}
+
 /// Rescale columns of W so each sums to 1 (used by Lee/nsNMF when rescale=true).
 fn col_rescale(w: &mut ndarray::Array2<f64>) {
     let r = w.ncols();
@@ -1906,6 +2259,303 @@ fn py_euclidean_update_w<'py>(
     out.into_pyarray_bound(py)
 }
 
+#[derive(Clone, Copy)]
+enum FixedFactorKind {
+    FixedH,
+    FixedW,
+}
+
+fn validate_fixed_factor_inputs(
+    kind: FixedFactorKind,
+    v: &Array2<f64>,
+    fixed: &Array2<f64>,
+    initial: &Array2<f64>,
+    max_iter: usize,
+    check_interval: usize,
+    num_threads: Option<usize>,
+) -> PyResult<()> {
+    for (name, matrix) in [("V", v), ("fixed factor", fixed), ("initial factor", initial)] {
+        if matrix.nrows() == 0 || matrix.ncols() == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "{} must have non-zero dimensions, found {:?}",
+                name,
+                matrix.dim()
+            )));
+        }
+        if matrix.iter().any(|value| !value.is_finite()) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "{} contains non-finite values",
+                name
+            )));
+        }
+        if matrix.iter().any(|value| *value < 0.0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "{} contains negative values",
+                name
+            )));
+        }
+    }
+    if max_iter == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "max_iter must be at least one",
+        ));
+    }
+    if check_interval == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "check_interval must be at least one",
+        ));
+    }
+    if num_threads == Some(0) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "num_threads must be at least one",
+        ));
+    }
+
+    let (n, p) = v.dim();
+    match kind {
+        FixedFactorKind::FixedH => {
+            let rank = fixed.nrows();
+            if fixed.ncols() != p {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "H_fixed shape {:?} is incompatible with V shape {:?}",
+                    fixed.dim(),
+                    v.dim()
+                )));
+            }
+            if initial.dim() != (n, rank) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "W0 shape {:?} != expected ({}, {})",
+                    initial.dim(),
+                    n,
+                    rank
+                )));
+            }
+        }
+        FixedFactorKind::FixedW => {
+            let rank = fixed.ncols();
+            if fixed.nrows() != n {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "W_fixed shape {:?} is incompatible with V shape {:?}",
+                    fixed.dim(),
+                    v.dim()
+                )));
+            }
+            if initial.dim() != (rank, p) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "H0 shape {:?} != expected ({}, {})",
+                    initial.dim(),
+                    rank,
+                    p
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn py_fixed_factor_brunet<'py>(
+    py: Python<'py>,
+    kind: FixedFactorKind,
+    v: PyReadonlyArray2<'py, f64>,
+    fixed: PyReadonlyArray2<'py, f64>,
+    initial: PyReadonlyArray2<'py, f64>,
+    max_iter: usize,
+    check_interval: usize,
+    stopconv: usize,
+    num_threads: Option<usize>,
+) -> PyResult<PyObject> {
+    // Include Rust-side input materialisation and scoped-pool construction in
+    // the reported extension runtime.  Python-side dtype/order coercion in the
+    // public wrapper remains outside this measurement.
+    let started = std::time::Instant::now();
+    // PyReadonlyArray is not Ungil, so own all inputs before releasing the GIL.
+    let v_owned = v.as_array().to_owned();
+    let fixed_owned = fixed.as_array().to_owned();
+    let initial_owned = initial.as_array().to_owned();
+    validate_fixed_factor_inputs(
+        kind,
+        &v_owned,
+        &fixed_owned,
+        &initial_owned,
+        max_iter,
+        check_interval,
+        num_threads,
+    )?;
+
+    let local_pool = if let Some(threads) = num_threads {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(|error| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "failed to build rayon pool with {} threads: {}",
+                        threads, error
+                    ))
+                })?,
+        )
+    } else {
+        None
+    };
+
+    let run_core = move || match kind {
+        FixedFactorKind::FixedH => fixed_h_brunet_run(
+            &v_owned.view(),
+            &fixed_owned.view(),
+            initial_owned,
+            max_iter,
+            check_interval,
+            stopconv,
+        ),
+        FixedFactorKind::FixedW => fixed_w_brunet_run(
+            &v_owned.view(),
+            &fixed_owned.view(),
+            initial_owned,
+            max_iter,
+            check_interval,
+            stopconv,
+        ),
+    };
+
+    let outcome = py
+        .allow_threads(move || {
+            if let Some(pool) = local_pool {
+                pool.install(run_core)
+            } else {
+                run_core()
+            }
+        })
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+    let runtime_seconds = started.elapsed().as_secs_f64();
+    let metrics = outcome.metrics;
+
+    let fixed_factor = pyo3::types::PyDict::new_bound(py);
+    fixed_factor.set_item("name", metrics.fixed_factor_name)?;
+    fixed_factor.set_item(
+        "shape",
+        [metrics.fixed_factor_shape.0, metrics.fixed_factor_shape.1],
+    )?;
+    fixed_factor.set_item("sha256_before", &metrics.fixed_factor_sha256_before)?;
+    fixed_factor.set_item("sha256_after", &metrics.fixed_factor_sha256_after)?;
+    fixed_factor.set_item(
+        "byte_for_byte_unchanged",
+        metrics.fixed_factor_sha256_before == metrics.fixed_factor_sha256_after,
+    )?;
+
+    let backend = pyo3::types::PyDict::new_bound(py);
+    backend.set_item("engine", "rust")?;
+    backend.set_item("num_threads", metrics.num_threads)?;
+
+    let metric_dict = pyo3::types::PyDict::new_bound(py);
+    metric_dict.set_item("schema_version", "1.0")?;
+    metric_dict.set_item("protocol", "nmf_rs_fixed_factor_brunet_v1")?;
+    metric_dict.set_item("operation", metrics.operation)?;
+    metric_dict.set_item("method", "brunet")?;
+    metric_dict.set_item("objective_name", "kullback_leibler")?;
+    metric_dict.set_item("update_function", metrics.update_function)?;
+    metric_dict.set_item("iterations", metrics.iterations)?;
+    metric_dict.set_item("max_iter", metrics.max_iter)?;
+    metric_dict.set_item("check_interval", metrics.check_interval)?;
+    metric_dict.set_item("stopconv", metrics.stopconv)?;
+    metric_dict.set_item("connectivity_checks", metrics.connectivity_checks)?;
+    metric_dict.set_item(
+        "stable_connectivity_checks",
+        metrics.stable_connectivity_checks,
+    )?;
+    metric_dict.set_item("converged", metrics.converged)?;
+    metric_dict.set_item("converged_by_connectivity", metrics.converged)?;
+    metric_dict.set_item("eps", f64::EPSILON)?;
+    metric_dict.set_item(
+        "eps_floor_interval",
+        FIXED_FACTOR_EPS_FLOOR_INTERVAL,
+    )?;
+    metric_dict.set_item(
+        "eps_floor_applications",
+        metrics.eps_floor_applications,
+    )?;
+    metric_dict.set_item("objective", metrics.objective_kl)?;
+    metric_dict.set_item("objective_kl", metrics.objective_kl)?;
+    metric_dict.set_item("runtime_seconds", runtime_seconds)?;
+    metric_dict.set_item("num_threads", metrics.num_threads)?;
+    metric_dict.set_item("fixed_factor", fixed_factor)?;
+    metric_dict.set_item("backend", backend)?;
+
+    let factor_object = outcome.factor.into_pyarray_bound(py).into_any().unbind();
+    let metrics_object = metric_dict.into_any().unbind();
+    Ok(pyo3::types::PyTuple::new_bound(py, [factor_object, metrics_object]).into())
+}
+
+/// Run the complete Brunet loop while H is fixed and only W is updated.
+#[pyfunction]
+#[pyo3(signature = (
+    v,
+    h_fixed,
+    w0,
+    max_iter,
+    *,
+    check_interval = 10,
+    stopconv = 40,
+    num_threads = None,
+))]
+fn py_fixed_h_brunet<'py>(
+    py: Python<'py>,
+    v: PyReadonlyArray2<'py, f64>,
+    h_fixed: PyReadonlyArray2<'py, f64>,
+    w0: PyReadonlyArray2<'py, f64>,
+    max_iter: usize,
+    check_interval: usize,
+    stopconv: usize,
+    num_threads: Option<usize>,
+) -> PyResult<PyObject> {
+    py_fixed_factor_brunet(
+        py,
+        FixedFactorKind::FixedH,
+        v,
+        h_fixed,
+        w0,
+        max_iter,
+        check_interval,
+        stopconv,
+        num_threads,
+    )
+}
+
+/// Run the complete Brunet loop while W is fixed and only H is updated.
+#[pyfunction]
+#[pyo3(signature = (
+    v,
+    w_fixed,
+    h0,
+    max_iter,
+    *,
+    check_interval = 10,
+    stopconv = 40,
+    num_threads = None,
+))]
+fn py_fixed_w_brunet<'py>(
+    py: Python<'py>,
+    v: PyReadonlyArray2<'py, f64>,
+    w_fixed: PyReadonlyArray2<'py, f64>,
+    h0: PyReadonlyArray2<'py, f64>,
+    max_iter: usize,
+    check_interval: usize,
+    stopconv: usize,
+    num_threads: Option<usize>,
+) -> PyResult<PyObject> {
+    py_fixed_factor_brunet(
+        py,
+        FixedFactorKind::FixedW,
+        v,
+        w_fixed,
+        h0,
+        max_iter,
+        check_interval,
+        stopconv,
+        num_threads,
+    )
+}
+
 /// Run a full NMF iteration loop. Returns (W, H, [offset], n_iter, deviances).
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
@@ -2181,6 +2831,8 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_divergence_update_w, m)?)?;
     m.add_function(wrap_pyfunction!(py_euclidean_update_h, m)?)?;
     m.add_function(wrap_pyfunction!(py_euclidean_update_w, m)?)?;
+    m.add_function(wrap_pyfunction!(py_fixed_h_brunet, m)?)?;
+    m.add_function(wrap_pyfunction!(py_fixed_w_brunet, m)?)?;
     m.add_function(wrap_pyfunction!(py_nmf_run, m)?)?;
     m.add_function(wrap_pyfunction!(py_smoothing_matrix, m)?)?;
     Ok(())
@@ -2224,5 +2876,83 @@ mod tests {
         assert!(h.iter().all(|x| *x >= 0.0));
         // KL should not increase from start to end.
         assert!(devs.last().unwrap() <= devs.first().unwrap());
+    }
+
+    fn fixed_factor_fixture() -> (Array2<f64>, Array2<f64>, Array2<f64>) {
+        let v = array![
+            [3.0, 1.0, 4.0, 2.0, 5.0],
+            [1.0, 5.0, 2.0, 4.0, 3.0],
+            [2.0, 3.0, 1.0, 5.0, 4.0],
+            [5.0, 2.0, 3.0, 1.0, 4.0]
+        ];
+        let w = array![[0.8, 0.2], [0.3, 0.7], [0.6, 0.4], [0.1, 0.9]];
+        let h = array![[0.9, 0.8, 0.2, 0.1, 0.7], [0.1, 0.2, 0.8, 0.9, 0.3]];
+        (v, w, h)
+    }
+
+    #[test]
+    fn fixed_h_full_loop_matches_single_step_kernel() {
+        let (v, w0, h_fixed) = fixed_factor_fixture();
+        let fixed_before = h_fixed.clone();
+        let mut expected = w0.clone();
+        for iteration in 1..=10 {
+            expected = divergence_update_w_impl(&v.view(), &expected.view(), &h_fixed.view());
+            if iteration % 10 == 0 {
+                pmax_inplace(&mut expected, f64::EPSILON);
+            }
+        }
+
+        let outcome = fixed_h_brunet_run(&v.view(), &h_fixed.view(), w0, 10, 100, 40)
+            .expect("fixed-H run should succeed");
+        assert_eq!(outcome.factor, expected);
+        assert_eq!(h_fixed, fixed_before);
+        assert_eq!(outcome.metrics.iterations, 10);
+        assert_eq!(outcome.metrics.eps_floor_applications, 1);
+        assert_eq!(
+            outcome.metrics.fixed_factor_sha256_before,
+            outcome.metrics.fixed_factor_sha256_after
+        );
+    }
+
+    #[test]
+    fn fixed_w_full_loop_matches_single_step_kernel() {
+        let (v, w_fixed, h0) = fixed_factor_fixture();
+        let fixed_before = w_fixed.clone();
+        let mut expected = h0.clone();
+        for iteration in 1..=10 {
+            expected = divergence_update_h_impl(&v.view(), &w_fixed.view(), &expected.view());
+            if iteration % 10 == 0 {
+                pmax_inplace(&mut expected, f64::EPSILON);
+            }
+        }
+
+        let outcome = fixed_w_brunet_run(&v.view(), &w_fixed.view(), h0, 10, 100, 40)
+            .expect("fixed-W run should succeed");
+        assert_eq!(outcome.factor, expected);
+        assert_eq!(w_fixed, fixed_before);
+        assert_eq!(outcome.metrics.iterations, 10);
+        assert_eq!(outcome.metrics.eps_floor_applications, 1);
+        assert!(outcome.metrics.objective_kl.is_finite());
+    }
+
+    #[test]
+    fn fixed_factor_connectivity_uses_strict_r_stopconv() {
+        let v = array![[4.0, 3.0, 1.0, 1.0], [1.0, 1.0, 3.0, 4.0]];
+        let w_fixed = array![[1.0, 0.0], [0.0, 1.0]];
+        let h0 = array![[0.8, 0.7, 0.2, 0.1], [0.2, 0.3, 0.8, 0.9]];
+
+        let quick = fixed_w_brunet_run(&v.view(), &w_fixed.view(), h0.clone(), 100, 10, 2)
+            .expect("fixed-W run should succeed");
+        assert_eq!(quick.metrics.iterations, 40);
+        assert_eq!(quick.metrics.connectivity_checks, 4);
+        assert_eq!(quick.metrics.stable_connectivity_checks, 3);
+        assert!(quick.metrics.converged);
+
+        let default = fixed_w_brunet_run(&v.view(), &w_fixed.view(), h0, 1000, 10, 40)
+            .expect("fixed-W run should succeed");
+        assert_eq!(default.metrics.iterations, 420);
+        assert_eq!(default.metrics.connectivity_checks, 42);
+        assert_eq!(default.metrics.stable_connectivity_checks, 41);
+        assert!(default.metrics.converged);
     }
 }
